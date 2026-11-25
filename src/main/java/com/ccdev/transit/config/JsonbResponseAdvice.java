@@ -23,7 +23,8 @@ public class JsonbResponseAdvice implements ResponseBodyAdvice<Object> {
 
     private static final Set<String> JSON_KEYS = Set.of(
             "treatment_rules", "primary_metrics", "safety_metrics",
-            "network_config", "analysis_config", "detail", "evidence", "path_detail");
+            "network_config", "analysis_config", "detail", "evidence", "path_detail",
+            "support_links");
 
     @Override
     public boolean supports(MethodParameter returnType,

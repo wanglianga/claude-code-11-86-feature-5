@@ -14,8 +14,12 @@
 5. **共同支持器**：时段 × OD 区间 × 天气 × 服务可达性，检查两臂加权样本；不满足只报覆盖缺口，不外推。
 6. **估计器**：乘客人数加权 Hajek **ITT**、按随机化单元聚类的 CR1 区间、CACE/Wald-IV、跨线暴露率 Wilson 区间、簇方案 2⁴ 随机化推断（RI）。
 7. **独立护栏**：投诉率、满载班次占比、滞留/未完成旅程占比；任一硬护栏超限即 `STOP_EXPANSION`，扩围结论 `BLOCKED`，服务端同时拒绝人工改判 `GO`。
-8. **外部事件按事件时间关联**：暴雨停运、降雨、施工、临时改线均带事件窗口；投诉同时保存 `complaint_time` 与 `service_event_time`，统计只用后者。
-9. **界面**：随机分配、暴露路径、共同支持、客流结果、护栏、离线审阅、扩围证据等 10 个标签页；另含 Swagger UI / OpenAPI 3。
+8. **试点净运营成本归集（本题新增）**：成本账把**司机加班、油电消耗、临时/备用车辆、维修、取消班次损失**五类凭证绑定到 **720 个可追溯车辆块/处理周期**；共享资源分摊器处理**一辆备用车跨线同时支援 R1 处理班与 R2 对照班**、以及**一次跨 R1/R2 且跨 AM/PM 班的维修**。结果层输出每个分配单元的五类成本分项、按随机分配臂计算的 **ITT 成本差（元/合格服务单元）**，并**保留未归属额**。给出两条归属路线：
+   - **直接凭证归属（DIRECT）**：可追溯车辆块直接入账，真实度高；共同备用车与跨线/跨班维修不武断拆分，留下 **¥4,400 未归属余额**，并据此给出每合格单元净成本的保守归属区间；
+   - **冻结驱动分摊（DRIVER_ALLOC）**：按登记时**冻结的车辆小时 / 车辆公里 / 维修工时**把共享成本分到支援范围，未归属为 0、账面完整；驱动份额是假设，故给出三种驱动 + 规范组合的 **ITT 敏感性区间**。
+   - 收入/节省只有 `confirmed=true` 且带 `confirmation_ref` 才冲减净成本；**未确认的“增收/节省”估计（样例 ¥68,000）只作备忘披露，绝不用于把成本填平**。凭证号唯一 + 到分守恒保证**不重复计费**。
+9. **外部事件按事件时间关联**：暴雨停运、降雨、施工、临时改线均带事件窗口；投诉同时保存 `complaint_time` 与 `service_event_time`，统计只用后者。
+10. **界面**：随机分配、暴露路径、共同支持、客流结果、**试点成本归集**、护栏、离线审阅、扩围证据等 **11 个标签页**；另含 Swagger UI / OpenAPI 3。
 
 ---
 
@@ -115,13 +119,16 @@ mvn test
 结果（最后一次实际运行）：
 
 ```
-Tests run: 16, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 22, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
 覆盖：50% 平衡分配与确定性哈希、R1/R2 聚类/R3 独立、全部命名路径分类
 （分流/同车普通对照/对照转乘处理/全程 T/全程 C/不执行/两类 UNKNOWN）、
-聚类 ITT 公式、Wilson 区间与 RI 枚举。
+聚类 ITT 公式、Wilson 区间与 RI 枚举；以及 6 个 `CostEngineTest`：
+最大余额法**到分分摊**、**不重复计费/总额守恒**、直接法保留共享**未归属**而驱动分摊清零、
+ITT 符号与未归属保守边界、每合格单元净成本区间有序、**未确认估计不冲减成本**、
+孤儿直接凭证在两种方法下都保留为未归属、跨臂备用车/跨线维修证据识别。
 
 ### 2. 端到端不变量脚本（实际执行 ✅）
 
@@ -134,9 +141,11 @@ BUILD SUCCESS
 脚本仅依赖 `bash/curl/python3`（标准库），实际结果：
 
 ```
-通过 34 项，失败 0 项
+通过 62 项，失败 0 项
 ALL_VERIFY_CHECKS_PASSED
 ```
+
+> 注：仓库里的 `verify.sh` 为 LF 行尾（若在 Windows 上被改成 CRLF，先 `sed -i 's/\r$//' verify.sh`）。
 
 核验内容包括：
 
@@ -147,12 +156,14 @@ ALL_VERIFY_CHECKS_PASSED
 - 共同支持缺口存在；投诉、滞留两条护栏超限；
 - 投诉确有滞后提交且按 `service_event_time` 关联；
 - analyst 不能调用扩围评估（403）；approver 得到 `BLOCKED`；护栏超限时人工 `GO` 被拒（409）；
+- **试点成本归集（28 项）**：720 单元 360/360；恰好两笔加班；备用车凭证 `COST-TEMP-SPARE-001`（¥1,800，SHARED）的支援链接同时含 R1/TREATMENT 与 R2/CONTROL；一次跨线跨班维修 `COST-MAINT-CROSS-001`（¥2,600，SHARED）；凭证数与对账一致、OVERTIME 恰 2 张；直接法“已归属+未归属=总额”、分摊差异=0；直接法未归属 ¥4,400 > 0 而分摊法为 0、两方法余额不同；两方法净总额都等于“凭证总额−已确认抵扣”；两条每合格单元净成本区间有序；ITT 成本差为正且分摊 ITT 点估计被驱动情景区间包住；4 个驱动情景；线路“触及敞口”标注不可加且其和大于未归属额（跨线重复列示）、R3 敞口为 0；¥68,000 未确认估计被排除；`/costs/unit-costs?method=...` 两方法各 720 行；以及抵扣纪律的可重复生命周期——未确认 ¥888,888 不改变净成本、`confirmed=true` 缺 `confirmation_ref` 返回 400、补凭证后 ¥1,337 精确冲减、还原未确认后回到基线；
 - `/v3/api-docs`、`/swagger-ui/index.html`、前端页面与 `app.js` 均可访问。
 
 ### 3. 前端渲染冒烟（实际执行 ✅）
 
 本环境没有浏览器，我用临时目录中的 `jsdom` 对**真实运行的后端**加载 `index.html + app.js`：
-10 个标签页全部成功渲染、命名旅程弹窗输出逐段判定追踪、`CROSS_MIXED` 过滤可交互，
+**11 个标签页全部成功渲染**（含新增“💰 试点成本归集”页：样例证据卡、两方法区间、对账、驱动情景、线路敞口、
+抵扣纪律交互与 200 行单元分项），命名旅程弹窗输出逐段判定追踪、`CROSS_MIXED` 过滤可交互、成本臂筛选可点击，
 结果 `UI_SMOKE_OK`，无运行时错误。该冒烟脚本在 `/tmp/uismoke/smoke.mjs`（临时目录，不属于交付物）。
 
 ### 4. 我没有执行的验证
@@ -203,6 +214,38 @@ ALL_VERIFY_CHECKS_PASSED
 
 因此扩围证据页与全局横幅均为 **BLOCKED**：即使平均候车显著改善，投诉与安全护栏超限仍独立阻止扩围。
 
+### 试点成本归集样例数字（同一四周随机试点，人民币元，确定性可复现）
+
+成本播种器 `CostDataSeeder` 为 **720 个合格分配单元各建一个车辆块**（360 处理 / 360 对照），
+冻结其车辆小时/公里/维修工时，并生成 **736 张唯一凭证**：720 张按公里计量的油电凭证、
+**恰好 2 笔加班**（`COST-OT-001/002`，均在处理臂，合计 ¥1,600）、
+**1 张跨臂备用车共享凭证 ¥1,800**、**1 张跨线跨班维修共享凭证 ¥2,600**、
+4 张 T/C 同额配对的常规维修、以及暴雨停运的 8 张取消班次损失。凭证总额 **¥52,553.36**。
+
+| 口径 | 直接凭证归属 DIRECT | 冻结驱动分摊 DRIVER_ALLOC |
+| --- | ---: | ---: |
+| 已归属/分摊后 gross | ¥48,153.36 | ¥52,553.36 |
+| 未归属余额 | **¥4,400.00**（备用车+跨线维修） | **¥0.00**（账面完整） |
+| 已确认抵扣（保险追偿，有凭证号） | −¥400.00 | −¥400.00 |
+| 净运营成本总额 | **¥52,153.36** | **¥52,153.36** |
+| 每合格服务单元净成本区间 | **¥66.32 ~ ¥72.44**（点值 ¥66.32，低端不含未归属） | **¥72.44**（未归属 0，总体为点） |
+| ITT 成本差（处理−对照，元/单元） | **+3.28**，保守归属边界 [−8.94, +15.51] | **+3.35**，驱动假设区间 **[3.19, 3.66]** |
+
+- **直接法 ITT 边界**：把整笔 ¥4,400 未归属余额极端全归对照（下界）或全归处理（上界），
+  因 N_T=N_C=360，半宽 = 4400/360 ≈ 12.22；这是**归属不确定性边界，不是抽样置信区间**。
+- **分摊法驱动敏感性**：规范组合 ITT +3.35；强制全部按车辆小时 +3.58、全部按公里 +3.66、
+  全部按维修工时 +3.19——总体每单元成本不变，驱动只改变在两臂/线路间的分布。
+- **不重复计费**：`cost_voucher.voucher_code` 唯一；共享凭证只入一次账，分摊是“把同一笔钱搬入单元”，
+  不是在其上追加。`CostEngine` 内部按“分”用最大余额法分摊，分摊合计与共享凭证额差异严格为 0；
+  `cost_unit_cost` 两方法各 720 行，gross 合计分别精确等于 ¥48,153.36 / ¥52,553.36。
+- **线路未归属敞口（备忘，不可跨线相加）**：备用车与跨线维修都触及 R1、R2，故 R1、R2 各自列示
+  ¥4,400 全额敞口、R3 为 ¥0；两线敞口之和 ¥8,800 > ¥4,400，正是跨线凭证在各线重复列示所致，
+  相加会重复计费。可加的线路成本请看分摊后的 `net_cost_alloc`。
+- **不得用估计填平**：样例另有一笔 ¥68,000 的“准点提升带来票收增收+用工节省”**未确认估计**
+  （`OFF-EST-UNCONF-001`，无 `confirmation_ref`），若错误计入会把净成本填成净节省；
+  系统将其放在 `excluded_unconfirmed_estimate_total`，**净成本 ¥52,153.36 不因它改变**。
+  `POST /api/experiments/{id}/costs/offsets` 对 `confirmed=true` 但无凭证号的请求直接返回 400。
+
 ---
 
 ## 六、主要 HTTP API
@@ -223,7 +266,12 @@ ALL_VERIFY_CHECKS_PASSED
 | `GET /api/experiments/{id}/analysis` | 全部估计结果 |
 | `GET/POST /api/experiments/{id}/guardrails[/evaluate]` | 护栏规则/最新评估/重新评估 |
 | `GET /api/experiments/{id}/expansion`、`POST .../expansion/evaluate|decide` | 扩围证据与结论（APPROVER） |
-| `GET /api/experiments/{id}/review-bundle` | 离线审阅包（冻结配置+分配哈希+追踪+结果） |
+| `GET /api/experiments/{id}/review-bundle` | 离线审阅包（冻结配置+分配哈希+追踪+结果+`costReport`） |
+| `GET /api/experiments/{id}/costs` | **成本归集完整报告**：两方法、对账、未归属池、线路敞口、ITT 成本差与每单元净成本区间、驱动情景、样例证据、720 单元分项、凭证账与抵扣行（另有别名 `/cost`、`/cost-report`、`/cost-allocation`） |
+| `GET /api/experiments/{id}/costs/vouchers?category=OVERTIME` | 成本凭证账，可按五类过滤（别名 `/cost-ledger`） |
+| `GET /api/experiments/{id}/costs/unit-costs?method=DIRECT\|DRIVER_ALLOC` | 结果层：每分配单元 × 方法的五类成本分项（`cost_unit_cost`，各 720 行） |
+| `POST /api/experiments/{id}/costs/recompute` | 用冻结凭证重算分摊与单元结果（ANALYST+；`/pipeline/run` 也会自动调用） |
+| `POST /api/experiments/{id}/costs/offsets` | 登记/更新收入或节省抵扣；`confirmed=true` 必须给 `confirmationRef`，否则 400（ANALYST+，幂等 upsert） |
 | `GET /api/experiments/{id}/events`、`/complaints` | 外部事件时间线、投诉时间关联核验 |
 
 ---
@@ -232,15 +280,15 @@ ALL_VERIFY_CHECKS_PASSED
 
 ```
 src/main/java/com/ccdev/transit/
-  engine/            # 纯逻辑、无 Spring：确定性哈希、平衡分配、网络聚类、路径分类、统计/RI
-  service/           # 登记冻结、确定性播种器、分析流水线、扩围决策
-  web/               # REST 控制器与 DTO
+  engine/            # 纯逻辑、无 Spring：确定性哈希、平衡分配、网络聚类、路径分类、统计/RI、CostEngine 成本归集
+  service/           # 登记冻结、确定性播种器、分析流水线、扩围决策、CostService、CostDataSeeder 成本样例
+  web/               # REST 控制器（含 CostController）与 DTO
   config/ security/  # Spring Security 三角色、OpenAPI、jsonb 响应处理
 src/main/resources/
-  schema.sql         # 幂等 PostgreSQL 建表
-  static/            # 原生 JS 单页控制台（login/index/app/styles）
-src/test/java/...    # 16 个纯 JUnit 测试（不依赖数据库/Docker）
-verify.sh            # 34 项端到端不变量
+  schema.sql         # 幂等 PostgreSQL 建表（含 vehicle_block/cost_voucher/cost_offset/cost_unit_cost）
+  static/            # 原生 JS 单页控制台（login/index/app/styles，11 个标签页）
+src/test/java/...    # 22 个纯 JUnit 测试（不依赖数据库/Docker，含 6 个 CostEngineTest）
+verify.sh            # 62 项端到端不变量（含 28 项成本归集）
 Dockerfile docker-compose.yml docker-settings.xml
 ```
 
@@ -252,3 +300,7 @@ Dockerfile docker-compose.yml docker-settings.xml
 - **未知保留**：`INCOMPLETE_TAP/MID_ROUTE_CHANGE` 不插补、不归臂、不进效应估计，只计数并进入安全护栏。
 - **共同支持**：无支持层旅程不产生外推结论，仅在支持页与 `gaps` 中报告覆盖缺口。
 - **时间基准**：天气/施工/改线与 `service_ts` 按窗口重叠关联；护栏投诉率按 `complaint.service_event_time` 归集。
+- **成本 ITT 按随机分配臂**：成本随车辆块/单元按 `assignment_unit.arm` 归臂，司机不执行规则不改变其分配臂；成本 ITT 是“元/合格服务单元”的随机组均值差，不是乘客加权，也不是统计抽样 CI。
+- **未归属额始终保留**：直接法下共同备用车/跨线维修全额留在 `unallocated_amount`，绝不为了账面好看而静默清零；其每单元区间是归属边界而非置信区间。
+- **分摊只是搬运同一笔钱**：驱动分摊前后凭证总额不变，分摊合计与共享凭证额逐分相等；跨线“触及敞口”仅作追溯备忘、不可跨线相加。
+- **估计不得填平成本**：只有已确认且有凭证号的收入/节省可冲减净成本；投诉不货币化、加班按实际记录而非平均工资率估算。

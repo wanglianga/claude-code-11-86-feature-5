@@ -1,5 +1,6 @@
 package com.ccdev.transit.web;
 
+import com.ccdev.transit.service.CostService;
 import com.ccdev.transit.service.ExpansionService;
 import com.ccdev.transit.service.PipelineService;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -23,11 +24,14 @@ public class PipelineController {
     private final JdbcTemplate jdbc;
     private final PipelineService pipeline;
     private final ExpansionService expansion;
+    private final CostService costService;
 
-    public PipelineController(JdbcTemplate jdbc, PipelineService pipeline, ExpansionService expansion) {
+    public PipelineController(JdbcTemplate jdbc, PipelineService pipeline,
+                              ExpansionService expansion, CostService costService) {
         this.jdbc = jdbc;
         this.pipeline = pipeline;
         this.expansion = expansion;
+        this.costService = costService;
     }
 
     // ---------------- 流水线 ----------------
@@ -35,7 +39,9 @@ public class PipelineController {
     @PostMapping("/pipeline/run")
     public Map<String, Object> runPipeline(@PathVariable long id) {
         pipeline.rebuildAll(id);
-        return Map.of("ok", true, "message", "暴露账、共同支持、分析结果与护栏已用冻结数据重新计算");
+        costService.recompute(id);
+        return Map.of("ok", true, "message",
+                "暴露账、共同支持、分析结果、护栏与试点成本归集已用冻结数据重新计算");
     }
 
     @PostMapping("/analysis/run")
@@ -233,6 +239,7 @@ public class PipelineController {
                 ORDER BY id DESC
                 """, id));
         bundle.put("expansionDecisions", expansion.decisions(id));
+        bundle.put("costReport", costService.report(id));
         return bundle;
     }
 }

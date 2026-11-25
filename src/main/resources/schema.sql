@@ -328,3 +328,103 @@ CREATE TABLE IF NOT EXISTS load_count (
     capacity       INTEGER,
     load_factor    DOUBLE PRECISION
 );
+
+-- =====================================================================
+-- 试点成本归集（净运营成本，而非投诉货币化或用平均工资率估算）
+-- 成本账：加班 / 油电 / 临时车辆 / 维修 / 取消班次损失，绑定车辆块/处理周期
+-- =====================================================================
+
+-- 可追溯车辆块：一个合格随机化班次单元对应一个常规车辆块；另有跨线路备用块
+CREATE TABLE IF NOT EXISTS vehicle_block (
+    id                       BIGSERIAL PRIMARY KEY,
+    experiment_id            BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    block_code               TEXT NOT NULL,
+    unit_key                 TEXT,                  -- 对应 TRIP_RANDOMIZED 分配单元
+    trip_id                  BIGINT REFERENCES service_trip(id) ON DELETE SET NULL,
+    route_code               TEXT NOT NULL,         -- 主属线路；跨线共用资源为 MULTI
+    service_date             DATE,
+    week_index               INTEGER,
+    period_band              TEXT,
+    arm                      TEXT,                  -- 按随机分配（非实际执行）的臂
+    block_kind               TEXT NOT NULL DEFAULT 'REGULAR', -- REGULAR/SPARE/TEMPORARY
+    eligible                 BOOLEAN NOT NULL DEFAULT TRUE,   -- 是否合格服务单元
+    frozen_vehicle_hours     DOUBLE PRECISION NOT NULL DEFAULT 0, -- 冻结车辆小时（分摊驱动）
+    frozen_vehicle_km        DOUBLE PRECISION NOT NULL DEFAULT 0, -- 冻结车辆公里（分摊驱动）
+    frozen_maintenance_hours DOUBLE PRECISION NOT NULL DEFAULT 0, -- 冻结维修工时（分摊驱动）
+    UNIQUE (experiment_id, block_code)
+);
+CREATE INDEX IF NOT EXISTS idx_vblock_exp ON vehicle_block(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_vblock_unit ON vehicle_block(experiment_id, unit_key);
+
+-- 成本凭证账：每张实际凭证只入账一次（voucher_code 唯一），从源头防止重复计费
+CREATE TABLE IF NOT EXISTS cost_voucher (
+    id               BIGSERIAL PRIMARY KEY,
+    experiment_id    BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    voucher_code     TEXT NOT NULL,
+    cost_category    TEXT NOT NULL, -- OVERTIME/ENERGY/TEMP_VEHICLE/MAINTENANCE/CANCEL_LOSS
+    attribution      TEXT NOT NULL DEFAULT 'DIRECT', -- DIRECT 直接归属 / SHARED 共享待分摊
+    driver_basis     TEXT,          -- HOURS/KM/MAINT_HOURS：该共享凭证的首选分摊驱动
+    shared_pool      TEXT,          -- SPARE_VEHICLE/CROSS_LINE_MAINT ...
+    block_id         BIGINT REFERENCES vehicle_block(id) ON DELETE SET NULL,
+    block_code       TEXT,
+    unit_key         TEXT,
+    route_code       TEXT,
+    service_date     DATE,
+    week_index       INTEGER,
+    amount           NUMERIC(14,2) NOT NULL,
+    currency         TEXT NOT NULL DEFAULT 'CNY',
+    source_ref       TEXT,          -- 实际凭证号/工单号/发票号
+    description      TEXT,
+    cross_line       BOOLEAN NOT NULL DEFAULT FALSE, -- 跨线（服务多条线路）
+    cross_shift      BOOLEAN NOT NULL DEFAULT FALSE, -- 跨班（跨越多个班次/时段）
+    support_links    TEXT,          -- JSON：共享资源实际支援的块/线路/臂（可追溯，不直接拆分）
+    posted_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (experiment_id, voucher_code)
+);
+CREATE INDEX IF NOT EXISTS idx_costv_exp ON cost_voucher(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_costv_unit ON cost_voucher(experiment_id, unit_key);
+CREATE INDEX IF NOT EXISTS idx_costv_cat ON cost_voucher(experiment_id, cost_category);
+
+-- 收入/节省/追偿：只有 confirmed=TRUE 且有确认凭证号的才能冲减净成本；
+-- 未确认的估计（estimated/unconfirmed）一律排除在净成本之外，仅作备忘披露
+CREATE TABLE IF NOT EXISTS cost_offset (
+    id               BIGSERIAL PRIMARY KEY,
+    experiment_id    BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    offset_code      TEXT NOT NULL,
+    kind             TEXT NOT NULL, -- REVENUE/SAVING/RECOVERY/CLAIM
+    description      TEXT,
+    amount           NUMERIC(14,2) NOT NULL,
+    confirmed        BOOLEAN NOT NULL DEFAULT FALSE,
+    confirmation_ref TEXT,
+    unit_key         TEXT,
+    arm              TEXT,
+    route_code       TEXT,
+    service_date     DATE,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (experiment_id, offset_code)
+);
+CREATE INDEX IF NOT EXISTS idx_costoffset_exp ON cost_offset(experiment_id);
+
+-- 结果层：每个分配单元 × 归属方法的成本分项（重算时按 experiment+method 幂等重建）
+CREATE TABLE IF NOT EXISTS cost_unit_cost (
+    id                 BIGSERIAL PRIMARY KEY,
+    experiment_id      BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    method             TEXT NOT NULL, -- DIRECT 直接凭证归属 / DRIVER_ALLOC 冻结驱动分摊
+    unit_key           TEXT NOT NULL,
+    block_code         TEXT,
+    route_code         TEXT,
+    arm                TEXT,
+    week_index         INTEGER,
+    overtime           NUMERIC(14,2) NOT NULL DEFAULT 0,
+    energy             NUMERIC(14,2) NOT NULL DEFAULT 0,
+    temp_vehicle       NUMERIC(14,2) NOT NULL DEFAULT 0,
+    maintenance        NUMERIC(14,2) NOT NULL DEFAULT 0,
+    cancel_loss        NUMERIC(14,2) NOT NULL DEFAULT 0,
+    direct_amount      NUMERIC(14,2) NOT NULL DEFAULT 0,
+    allocated_shared   NUMERIC(14,2) NOT NULL DEFAULT 0,
+    gross_cost         NUMERIC(14,2) NOT NULL DEFAULT 0,
+    confirmed_offset   NUMERIC(14,2) NOT NULL DEFAULT 0,
+    net_cost           NUMERIC(14,2) NOT NULL DEFAULT 0,
+    UNIQUE (experiment_id, method, unit_key)
+);
+CREATE INDEX IF NOT EXISTS idx_cuc_exp ON cost_unit_cost(experiment_id, method);

@@ -151,7 +151,126 @@ st, body = req("POST", f"/api/experiments/{eid}/expansion/decide",
                body={"decision": "GO", "reason": "try override"})
 check("护栏超限时人工 GO 被服务端拒绝(409)", st == 409, f"status={st}")
 
-# 10. OpenAPI / Swagger / 前端
+# 10. 试点成本归集：两归属路线 / 不重复计费 / 未归属余额 / 净成本区间 / 抵扣纪律
+st, costs = req("GET", f"/api/experiments/{eid}/costs")
+check("成本报告 /costs 200 且含两方法",
+      st == 200 and isinstance(costs, dict)
+      and "direct_attribution" in costs and "driver_allocation" in costs, str(st))
+
+if isinstance(costs, dict) and costs.get("reconciliation"):
+    rec = costs["reconciliation"]; ev = costs.get("sample_evidence", {}) or {}
+    off = costs.get("offsets", {}) or {}
+    dm = costs["direct_attribution"]; am = costs["driver_allocation"]
+    check("成本：720 合格单元且 360/360",
+          costs.get("qualified_service_units") == 720
+          and costs.get("treatment_units") == 360 and costs.get("control_units") == 360)
+    check("成本：样例恰好两笔司机加班", ev.get("overtime_record_count") == 2)
+    spare_v = ev.get("spare_vehicle_voucher") or {}
+    spare_arms = {s.get("arm") for s in (spare_v.get("support_links") or [])}
+    spare_routes = {s.get("route_code") for s in (spare_v.get("support_links") or [])}
+    check("成本：一辆备用车同时支援 R1处理班+R2对照班",
+          ev.get("spare_vehicle_present") and ev.get("spare_serves_treatment_and_control")
+          and {"TREATMENT", "CONTROL"} <= spare_arms and {"R1", "R2"} <= spare_routes,
+          f"arms={spare_arms} routes={spare_routes}")
+    mx = ev.get("cross_line_maintenance_voucher") or {}
+    check("成本：一次跨线且跨班维修",
+          ev.get("cross_line_maintenance_present") and mx.get("cross_line") and mx.get("cross_shift"))
+
+    ledger = costs.get("voucher_ledger", []) or []
+    check("成本：凭证唯一、不重复且凭证数=账内行数",
+          rec.get("no_double_billing") is True
+          and rec.get("distinct_voucher_count") == len(ledger) and len(ledger) >= 736,
+          f"distinct={rec.get('distinct_voucher_count')} rows={len(ledger)}")
+    check("成本：OVERTIME 凭证恰好 2 张",
+          len([v for v in ledger if v.get("cost_category") == "OVERTIME"]) == 2)
+    sp = [v for v in ledger if v.get("voucher_code") == "COST-TEMP-SPARE-001"]
+    check("成本：备用车凭证 1800 且为 SHARED（不拆单）",
+          len(sp) == 1 and abs(float(sp[0]["amount"]) - 1800.0) < 0.01
+          and sp[0].get("attribution") == "SHARED")
+    mxrow = [v for v in ledger if v.get("voucher_code") == "COST-MAINT-CROSS-001"]
+    check("成本：跨线维修凭证 2600 且 SHARED",
+          len(mxrow) == 1 and abs(float(mxrow[0]["amount"]) - 2600.0) < 0.01
+          and mxrow[0].get("attribution") == "SHARED")
+
+    check("成本：直接法平衡 已归属+未归属=凭证总额",
+          rec.get("direct_balanced") is True
+          and abs(float(rec.get("direct_plus_unallocated_difference", 9))) < 0.01)
+    check("成本：分摊精确到分 分摊合计=共享凭证额",
+          rec.get("allocation_balanced") is True
+          and abs(float(rec.get("allocation_difference", 9))) < 0.01)
+    check("成本：直接法保留正的未归属余额", float(dm.get("unallocated_amount", 0)) > 1000)
+    check("成本：分摊法未归属=0 且账面完整",
+          abs(float(am.get("unallocated_amount", -1))) < 0.01 and am.get("books_complete") is True)
+    check("成本：两条归属路线的未归属余额不同",
+          abs(float(dm.get("unallocated_amount", 0)) - float(am.get("unallocated_amount", 0))) > 1)
+
+    check("成本：两方法净总额一致且=凭证总额-已确认抵扣",
+          abs(float(dm["net_operating_cost_total"]) - float(am["net_operating_cost_total"])) < 0.01
+          and abs(float(dm["net_operating_cost_total"])
+                  - (float(rec["voucher_total"]) - float(off["confirmed_offset_total"]))) < 0.01)
+
+    dr = dm["net_cost_per_qualified_unit"]; ar = am["net_cost_per_qualified_unit"]
+    check("成本：直接法每合格单元净成本区间有序且有宽度",
+          float(dr["low"]) - 1e-6 <= float(dr["point"]) <= float(dr["high"]) + 1e-6
+          and float(dr["high"]) - float(dr["low"]) > 1)
+    check("成本：分摊法总体区间完整、ITT 敏感性区间包住点估计",
+          float(ar["low"]) - 1e-6 <= float(ar["point"]) <= float(ar["high"]) + 1e-6
+          and float(am["itt_low"]) - 1e-6 <= float(am["itt_cost_difference_per_unit"])
+          <= float(am["itt_high"]) + 1e-6)
+    check("成本：按随机臂 ITT 成本差为正（处理臂加班驱动）",
+          float(dm["itt_cost_difference_per_unit"]) > 1
+          and float(am["itt_cost_difference_per_unit"]) > 1,
+          f"direct={dm['itt_cost_difference_per_unit']} alloc={am['itt_cost_difference_per_unit']}")
+    check("成本：给出 canonical+3 驱动共 4 个分摊情景",
+          len(costs.get("driver_scenarios", []) or []) == 4)
+
+    rb = costs.get("route_balances", []) or []
+    sum_exp = sum(float(r.get("unallocated_touched_exposure", 0)) for r in rb)
+    check("成本：线路敞口标注不可加且跨线重复列示（敞口和>未归属）",
+          rb and all(r.get("exposure_is_additive") is False for r in rb)
+          and sum_exp > float(dm["unallocated_amount"]) + 1,
+          f"sumExposure={sum_exp} unallocated={dm['unallocated_amount']}")
+    check("成本：R3 不经手 R1/R2 跨线共享凭证（其敞口为 0）",
+          any(r.get("route_code") == "R3"
+              and float(r.get("unallocated_touched_exposure", -1)) == 0 for r in rb))
+
+    check("成本：68000 未确认增收/节省估计被排除在净成本外",
+          float(off.get("excluded_unconfirmed_estimate_total", 0)) >= 68000.0
+          and int(off.get("unconfirmed_count", 0)) >= 1)
+
+st, uca = req("GET", f"/api/experiments/{eid}/costs/unit-costs?method=DRIVER_ALLOC")
+check("成本：结果层 DRIVER_ALLOC 每单元分项 720 行",
+      st == 200 and isinstance(uca, dict) and uca.get("total") == 720, str(uca)[:160])
+st, ucd = req("GET", f"/api/experiments/{eid}/costs/unit-costs?method=DIRECT")
+check("成本：结果层 DIRECT 每单元分项 720 行",
+      st == 200 and isinstance(ucd, dict) and ucd.get("total") == 720)
+
+# 抵扣纪律的可重复生命周期：固定 code，先归为未确认以稳定基线
+req("POST", f"/api/experiments/{eid}/costs/offsets", user="analyst",
+    body={"offsetCode": "OFF-VERIFY-COST", "amount": 1, "confirmed": False})
+st, base_cost = req("GET", f"/api/experiments/{eid}/costs")
+n0 = base_cost["direct_attribution"]["net_operating_cost_total"]
+st, plug = req("POST", f"/api/experiments/{eid}/costs/offsets", user="analyst",
+               body={"offsetCode": "OFF-VERIFY-COST", "amount": 888888, "confirmed": False})
+check("成本：未确认巨额节省不改变净成本（不得填平）",
+      st == 200 and abs(float(plug["net_operating_cost_total"]) - float(n0)) < 0.01,
+      f"{plug.get('net_operating_cost_total') if isinstance(plug,dict) else plug} vs {n0}")
+st, _ = req("POST", f"/api/experiments/{eid}/costs/offsets", user="analyst",
+            body={"offsetCode": "OFF-VERIFY-NOREF", "amount": 500, "confirmed": True})
+check("成本：声称已确认但缺 confirmation_ref 被服务端拒绝(400)", st == 400, f"status={st}")
+st, conf = req("POST", f"/api/experiments/{eid}/costs/offsets", user="analyst",
+               body={"offsetCode": "OFF-VERIFY-COST", "amount": 1337,
+                     "confirmed": True, "confirmationRef": "VERIFY-REF"})
+check("成本：已确认凭证抵扣精确减少净成本 1337",
+      st == 200 and abs(float(conf["net_operating_cost_total"]) - (float(n0) - 1337.0)) < 0.01,
+      f"{conf.get('net_operating_cost_total') if isinstance(conf,dict) else conf} vs {float(n0)-1337}")
+req("POST", f"/api/experiments/{eid}/costs/offsets", user="analyst",
+    body={"offsetCode": "OFF-VERIFY-COST", "amount": 1337, "confirmed": False})
+st, after_cost = req("GET", f"/api/experiments/{eid}/costs")
+check("成本：还原为未确认后净成本回到基线",
+      abs(float(after_cost["direct_attribution"]["net_operating_cost_total"]) - float(n0)) < 0.01)
+
+# 11. OpenAPI / Swagger / 前端
 for path in ["/v3/api-docs", "/swagger-ui/index.html", "/index.html", "/login.html", "/app.js"]:
     try:
         with urllib.request.urlopen(BASE + path, timeout=10) as r:

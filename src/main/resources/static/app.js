@@ -93,6 +93,7 @@ const TAB_TITLES = {
   exposure: ['暴露路径台账', '逐段关联计划分配、GPS 实际运行、折返/加班偏离与完整路径'],
   support: ['共同支持', '按时段 × 起讫区间 × 天气 × 可达性检查两臂可比范围'],
   analysis: ['客流结果估计', '乘客旅程加权 ITT、跨线暴露、CACE 与随机化推断区间'],
+  cost: ['试点成本归集', '加班/油电/临时车辆/维修/取消损失绑定车辆块；直接归属与冻结驱动分摊两路线，净成本区间与 ITT 成本差'],
   guardrails: ['投诉与满载护栏', '独立于平均候车改善；任一硬护栏超限即停止扩围'],
   review: ['离线审阅', '冻结证据包、确定性复算与完整 JSON 导出'],
   expansion: ['扩围证据', '主要指标 + 护栏证据形成 GO / HOLD / BLOCKED 结论']
@@ -603,6 +604,315 @@ function ciBlock(rows, title) {
       <div class="small mono">${fmt(r.estimate, 1)} [${fmt(r.ci_low, 1)}, ${fmt(r.ci_high, 1)}]</div>
     </div>`;
   }).join('');
+}
+
+/* ---------------- 试点成本归集 ---------------- */
+const COST_CAT_META = {
+  OVERTIME: { label: '司机加班', cls: 'amber' },
+  ENERGY: { label: '油电消耗', cls: 'teal' },
+  TEMP_VEHICLE: { label: '临时/备用车辆', cls: 'purple' },
+  MAINTENANCE: { label: '维修', cls: 'blue' },
+  CANCEL_LOSS: { label: '取消班次损失', cls: 'red' }
+};
+const money = x => (Number(x) < 0 ? '-¥' : '¥') + fmt(Math.abs(Number(x) || 0), 2);
+const signedYuan = x => (x > 0 ? '+¥' : x < 0 ? '−¥' : '¥') + fmt(Math.abs(x), 2);
+let costUnitArmFilter = 'ALL';
+
+RENDER.cost = async function () {
+  const d = await api(`/experiments/${EXP.id}/costs`);
+  window.__cost = d;
+  const rec = d.reconciliation, off = d.offsets, ev = d.sample_evidence;
+  const dm = d.direct_attribution, am = d.driver_allocation;
+
+  const cat = {};
+  for (const v of (d.voucher_ledger || [])) {
+    const k = v.cost_category;
+    cat[k] = cat[k] || { n: 0, direct: 0, shared: 0, total: 0 };
+    const amt = Number(v.amount) || 0;
+    cat[k].n++; cat[k].total += amt;
+    if (v.attribution === 'SHARED') cat[k].shared += amt; else cat[k].direct += amt;
+  }
+
+  $('#tab-cost').innerHTML = `
+    <div class="toolbar" style="margin-top:0">
+      <button class="btn primary" id="cost-recompute">▶ 用冻结凭证重新归集/分摊</button>
+      <span class="small muted">成本账唯一凭证号防重复入账；金额内部按分守恒；POST /costs/recompute</span>
+    </div>
+
+    <div class="grid cards-4">
+      ${stat('合格服务单元', d.qualified_service_units, d.treatment_units + ' 处理 / ' + d.control_units + ' 对照（严格 50%）')}
+      ${stat('记账凭证总额', money(rec.voucher_total), rec.distinct_voucher_count + ' 张唯一凭证 · 不重复计费', 'blue')}
+      ${stat('直接法未归属余额', money(dm.unallocated_amount), '共同备用车 + 跨线跨班维修', 'amber')}
+      ${stat('分摊法未归属', money(am.unallocated_amount), '冻结小时/公里/维修工时驱动，账面完整', 'green')}
+    </div>
+
+    <div class="banner blue" style="margin-top:12px"><span class="big">💡</span><div>
+      集团要的是同一 <b>4 周随机试点</b>的<b>净运营成本</b>：这里只归集加班、油电、临时车辆、维修、取消班次损失的真实凭证，
+      <b>不把投诉货币化、也不用平均工资率估算加班</b>。两条归属路线都给出每合格服务单元的净成本区间与按随机分配臂计算的 ITT 成本差；
+      收入/节省只有 <b>已确认且有凭证号</b>才能冲减，未确认估计一律排除。
+    </div></div>
+
+    <div class="grid cards-2" style="margin-top:14px">
+      ${methodCard(dm, '路线一 · 直接归属实际凭证')}
+      ${methodCard(am, '路线二 · 冻结驱动分摊共享成本')}
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>对账与“不重复计费”核验</h3>
+      <div class="grid cards-3">
+        ${check('凭证号唯一、只入账一次 / noDoubleBilling', rec.no_double_billing)}
+        ${check('直接法 已归属 + 未归属 = 凭证总额', rec.direct_balanced, '差异 ' + money(rec.direct_plus_unallocated_difference))}
+        ${check('分摊额合计 = 共享凭证额（到分）', rec.allocation_balanced, '差异 ' + money(rec.allocation_difference))}
+        ${check('两方法凭证 grand total 一致', rec.grand_totals_match_across_methods)}
+        ${check('分摊法账面完整（未归属=0）', rec.books_complete_under_allocation)}
+        ${check('分摊法结果表 cost_unit_cost 已重建', true, 'DIRECT/DRIVER_ALLOC 各 720 行')}
+      </div>
+      <p class="small muted" style="margin:10px 0 0">${rec.no_double_billing_basis}</p>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>题目指定样例证据（一辆跨臂备用车 · 一次跨线跨班维修 · 两笔加班）</h3>
+      <div class="grid cards-3">
+        <div class="evidence-box">
+          <div class="small muted">备用车同时支援</div>
+          <div style="margin:8px 0"><b>${ev.spare_vehicle_present ? money(ev.spare_vehicle_voucher.amount) : '缺失'}</b>
+            ${badge('TEMP_VEHICLE', 'purple')} ${badge('SHARED', 'amber')}</div>
+          ${(ev.spare_vehicle_voucher?.support_links || []).map(s => `<div class="small" style="margin:4px 0">
+             <code>${s.route_code}</code> ${armBadge(s.arm)}<div class="muted">${s.detail || ''}</div></div>`).join('')}
+          <div style="margin-top:6px">${ev.spare_serves_treatment_and_control ? '<span class="expected-ok">✓ 同一凭证横跨 R1 处理班 + R2 对照班</span>' : '<span class="expected-bad">✗ 未同时横跨两臂</span>'}</div>
+        </div>
+        <div class="evidence-box">
+          <div class="small muted">一次跨线 + 跨班维修</div>
+          <div style="margin:8px 0"><b>${ev.cross_line_maintenance_present ? money(ev.cross_line_maintenance_voucher.amount) : '缺失'}</b>
+            ${badge('MAINTENANCE', 'blue')} ${badge('SHARED', 'amber')}</div>
+          <div class="pill-row">${ev.cross_line_maintenance_voucher?.cross_line ? badge('跨线 R1/R2', 'purple') : ''}
+            ${ev.cross_line_maintenance_voucher?.cross_shift ? badge('跨 AM/PM 班', 'teal') : ''}</div>
+          <div class="small muted" style="margin-top:6px">${ev.cross_line_maintenance_voucher?.description || ''}</div>
+          <div class="small" style="margin-top:6px">支援 ${(ev.cross_line_maintenance_voucher?.support_links || []).length} 个车辆块；直接法全额未归属，分摊法按冻结维修工时分配。</div>
+        </div>
+        <div class="evidence-box">
+          <div class="small muted">司机加班记录（恰好 ${ev.overtime_record_count} 笔）</div>
+          ${ev.overtime_records.map(o => `<div style="margin:8px 0">
+             <b>${money(o.amount)}</b> <code class="small">${o.code}</code><br/>
+             <span class="small muted">${o.description || ''}</span></div>`).join('')}
+          ${ev.overtime_record_count === 2 ? '<span class="expected-ok">✓ 恰好两笔，均直接归属处理臂单元</span>' : '<span class="expected-bad">加班笔数应为 2</span>'}
+        </div>
+      </div>
+    </div>
+
+    <div class="grid cards-2" style="margin-top:14px">
+      <div class="card">
+        <h3>五个成本分项（凭证账：直接 vs 共享）</h3>
+        <div class="table-wrap"><table class="data"><thead><tr>
+          <th>类别</th><th class="num">凭证数</th><th class="num">直接归属</th><th class="num">共享/未归属</th><th class="num">合计</th>
+        </tr></thead><tbody>
+        ${CostEngineCategoriesRow(cat)}
+        </tbody></table></div>
+        <p class="small muted" style="margin-bottom:0">共享列在直接法下即未归属余额；在分摊法下按驱动进入各单元，合计不变。</p>
+      </div>
+      <div class="card">
+        <h3>分摊驱动敏感性（ITT 成本差，元/合格单元）</h3>
+        <div class="table-wrap"><table class="data"><thead><tr><th>驱动情景</th><th class="num">T 均值</th><th class="num">C 均值</th><th class="num">ITT(T−C)</th></tr></thead><tbody>
+        ${d.driver_scenarios.map(s => `<tr>
+          <td class="small"><b>${s.basis}</b><div class="muted">${s.label}</div></td>
+          <td class="num mono">${fmt(s.treatment_mean_net_per_unit, 2)}</td>
+          <td class="num mono">${fmt(s.control_mean_net_per_unit, 2)}</td>
+          <td class="num mono"><b>${s.itt_cost_difference_per_unit > 0 ? '+' : ''}${fmt(s.itt_cost_difference_per_unit, 2)}</b></td>
+        </tr>`).join('')}
+        </tbody></table></div>
+        <div class="banner amber" style="margin-top:10px"><span>⚠️</span><div class="small">${am.itt_interpretation}</div></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>按物理线路的归属与“触及敞口”（不可跨线相加）</h3>
+      <div class="table-wrap"><table class="data"><thead><tr>
+        <th>线路</th><th class="num">单元</th><th class="num">T/C</th>
+        <th class="num">直接成本</th><th class="num">分摊进入共享</th><th class="num">分摊法净成本</th>
+        <th class="num">触及未归属敞口(备忘)</th><th>未归属凭证</th>
+      </tr></thead><tbody>
+      ${d.route_balances.map(r => `<tr>
+        <td><b>${r.route_code}</b></td>
+        <td class="num">${r.units}</td>
+        <td class="num small">${r.treatment_units}/${r.control_units}</td>
+        <td class="num mono">${fmt(r.direct_amount, 2)}</td>
+        <td class="num mono">${fmt(r.driver_allocated_shared_amount, 2)}</td>
+        <td class="num mono"><b>${fmt(r.net_cost_alloc, 2)}</b></td>
+        <td class="num mono">${fmt(r.unallocated_touched_exposure, 2)}</td>
+        <td class="small">${(r.unallocated_voucher_codes || []).map(c => `<code>${c}</code>`).join(' ') || '—'}</td>
+      </tr>`).join('')}
+      </tbody></table></div>
+      <p class="small muted">${d.route_balances[0]?.exposure_note || ''}</p>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>收入/节省抵扣纪律：未确认估计不得填平成本</h3>
+      <div class="grid cards-3">
+        <div class="stat green"><div class="k">已确认并冲减</div><div class="v mono">${money(off.confirmed_offset_total)}</div><div class="hint">${off.confirmed_count} 笔 · 有 confirmation_ref</div></div>
+        <div class="stat red"><div class="k">排除的未确认估计</div><div class="v mono">${money(off.excluded_unconfirmed_estimate_total)}</div><div class="hint">${off.unconfirmed_count} 笔 · 仅备忘，不进净成本</div></div>
+        <div class="stat"><div class="k">净运营成本总额</div><div class="v mono">${money(dm.net_operating_cost_total)}</div><div class="hint">= 凭证总额 − 已确认抵扣</div></div>
+      </div>
+      <p class="small muted" style="margin:10px 0">${off.policy}</p>
+      <div class="toolbar" style="margin-bottom:8px">
+        <button class="btn" id="cost-plug-unconf">模拟：录入 999,999 未确认“节省”</button>
+        <button class="btn" id="cost-plug-conf">补凭证后确认 1,234</button>
+        <button class="btn" id="cost-plug-reset">还原为未确认</button>
+        <span id="plug-out" class="small"></span>
+      </div>
+      <div class="table-wrap" style="max-height:220px"><table class="data"><thead><tr>
+        <th>抵扣单</th><th>类型</th><th>说明</th><th class="num">金额</th><th>确认</th><th>凭证号</th>
+      </tr></thead><tbody>
+      ${(d.offset_rows || []).map(o => `<tr>
+        <td><code>${o.offset_code}</code></td><td class="small">${o.kind}</td>
+        <td class="small muted">${o.description || offsetDesc(o.offset_code)}</td>
+        <td class="num mono">${fmt(o.amount, 2)}</td>
+        <td>${o.confirmed === true || o.confirmed === 't' ? badge('已确认·冲减', 'green') : badge('未确认·排除', 'red')}</td>
+        <td class="small mono">${o.confirmation_ref ? o.confirmation_ref : '—'}</td>
+      </tr>`).join('')}
+      </tbody></table></div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>每个分配单元的成本分项（DRIVER_ALLOC 净成本，按净成本降序，最多渲染 200 行）</h3>
+      <div class="pill-row" id="cost-unit-chips" style="margin-bottom:10px">
+        ${['ALL', 'TREATMENT', 'CONTROL'].map(a => `<button class="filter-chip ${costUnitArmFilter === a ? 'active' : ''}" data-a="${a}">${a === 'ALL' ? '全部' : a === 'TREATMENT' ? '处理臂' : '对照臂'}</button>`).join('')}
+      </div>
+      <div class="table-wrap" style="max-height:560px"><table class="data"><thead><tr>
+        <th>分配单元 / 车辆块</th><th>线路</th><th>臂</th><th class="num">加班</th><th class="num">油电</th>
+        <th class="num">临时车</th><th class="num">维修</th><th class="num">取消损失</th>
+        <th class="num">分摊共享</th><th class="num">已确认抵扣</th><th class="num">净成本</th>
+      </tr></thead><tbody id="cost-unit-rows"></tbody></table></div>
+      <p class="small muted">完整 720 单元 × 两方法见 <code>GET /api/experiments/{id}/costs/unit-costs?method=DIRECT|DRIVER_ALLOC</code> 与 <code>/costs</code> 的 units。</p>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>成本凭证账（前 200 行；可经 /costs/vouchers?category= 取全量/分类）</h3>
+      <div class="table-wrap" style="max-height:420px"><table class="data"><thead><tr>
+        <th>凭证号</th><th>类别</th><th>归属</th><th>车辆块/单元</th><th>线路</th><th class="num">金额</th><th>凭证来源/说明</th>
+      </tr></thead><tbody>
+      ${(d.voucher_ledger || []).slice(0, 200).map(v => `<tr>
+        <td><code>${v.voucher_code}</code></td>
+        <td>${costCatBadge(v.cost_category)}</td>
+        <td>${v.attribution === 'SHARED' ? badge('共享·待分摊', 'amber') : badge('直接', 'green')}</td>
+        <td class="small"><code>${v.block_code || ''}</code>${v.unit_key ? `<div class="muted">${v.unit_key}</div>` : ''}</td>
+        <td>${v.route_code || ''}</td>
+        <td class="num mono"><b>${fmt(v.amount, 2)}</b></td>
+        <td class="small muted">${v.source_ref ? `<code>${v.source_ref}</code> · ` : ''}${v.description || ''}</td>
+      </tr>`).join('')}
+      </tbody></table></div>
+    </div>`;
+
+  drawCostUnits();
+  $$('#cost-unit-chips [data-a]').forEach(b => b.addEventListener('click', () => {
+    costUnitArmFilter = b.dataset.a;
+    $$('#cost-unit-chips [data-a]').forEach(x => x.classList.toggle('active', x === b));
+    drawCostUnits();
+  }));
+
+  $('#cost-recompute').addEventListener('click', async () => {
+    const b = $('#cost-recompute'); b.disabled = true; b.textContent = '归集中…';
+    try {
+      await guardAction(() => api(`/experiments/${EXP.id}/costs/recompute`, { method: 'POST' }), '成本已重新归集与分摊');
+      delete loaded.cost; RENDER.cost();
+    } finally { b.disabled = false; b.textContent = '▶ 用冻结凭证重新归集/分摊'; }
+  });
+
+  const plugOut = $('#plug-out');
+  async function plug(body, msg) {
+    try {
+      const r = await guardAction(() => api(`/experiments/${EXP.id}/costs/offsets`, { method: 'POST', body: JSON.stringify(body) }));
+      plugOut.innerHTML = msg(r);
+    } catch (e) { plugOut.innerHTML = `<span class="expected-bad">${e.message}</span>`; }
+  }
+  $('#cost-plug-unconf').addEventListener('click', () => plug(
+    { offsetCode: 'OFF-UI-PLUG', kind: 'REVENUE', amount: 999999, confirmed: false },
+    r => `<span class="expected-ok">已录入未确认 999,999：净成本仍为 <b>${money(r.net_operating_cost_total)}</b>（未被填平），排除项 ${money(r.excluded_unconfirmed_estimate_total)}</span>`));
+  $('#cost-plug-conf').addEventListener('click', () => plug(
+    { offsetCode: 'OFF-UI-PLUG', kind: 'SAVING', amount: 1234, confirmed: true, confirmationRef: 'UI-REF-0001' },
+    r => `<span class="expected-ok">补确认凭证后：净成本下降 1,234 → <b>${money(r.net_operating_cost_total)}</b></span>`));
+  $('#cost-plug-reset').addEventListener('click', () => plug(
+    { offsetCode: 'OFF-UI-PLUG', kind: 'SAVING', amount: 1234, confirmed: false },
+    r => `<span>已还原为未确认：净成本 <b>${money(r.net_operating_cost_total)}</b>（该笔重新排除）</span>`));
+};
+
+function drawCostUnits() {
+  const d = window.__cost;
+  if (!d) return;
+  let rows = d.units.slice();
+  if (costUnitArmFilter !== 'ALL') rows = rows.filter(u => u.arm === costUnitArmFilter);
+  rows.sort((a, b) => b.net_cost_alloc - a.net_cost_alloc);
+  rows = rows.slice(0, 200);
+  $('#cost-unit-rows').innerHTML = rows.map(u => `<tr>
+    <td class="small"><code>${u.unit_key}</code><div class="muted">${u.block_code || ''}</div></td>
+    <td><b>${u.route_code}</b></td>
+    <td>${armBadge(u.arm)}</td>
+    <td class="num mono">${costCell(u.direct_cost_by_category?.OVERTIME)}</td>
+    <td class="num mono">${costCell(u.direct_cost_by_category?.ENERGY)}</td>
+    <td class="num mono">${costCell(u.direct_cost_by_category?.TEMP_VEHICLE, u.allocated_shared_cost_by_category?.TEMP_VEHICLE)}</td>
+    <td class="num mono">${costCell(u.direct_cost_by_category?.MAINTENANCE, u.allocated_shared_cost_by_category?.MAINTENANCE)}</td>
+    <td class="num mono">${costCell(u.direct_cost_by_category?.CANCEL_LOSS)}</td>
+    <td class="num mono small">${fmt(u.allocated_shared_amount, 2)}</td>
+    <td class="num mono small">${u.confirmed_offset ? '−' + fmt(u.confirmed_offset, 2) : '—'}</td>
+    <td class="num mono"><b>${fmt(u.net_cost_alloc, 2)}</b><div class="muted small">直接法 ${fmt(u.net_cost_direct, 2)}</div></td>
+  </tr>`).join('') || '<tr><td colspan="11" class="muted" style="padding:18px;text-align:center">无单元</td></tr>';
+}
+
+function costCell(direct, allocated) {
+  const d = Number(direct) || 0, a = Number(allocated) || 0;
+  if (!d && !a) return '<span class="muted">·</span>';
+  if (a > 0.004) return `${fmt(d, 0)}<div class="small" style="color:var(--purple,#7a5af8)">+${fmt(a, 0)} 分摊</div>`;
+  return fmt(d, 0);
+}
+
+function costCatBadge(c) {
+  const m = COST_CAT_META[c] || { label: c, cls: 'gray' };
+  return badge(m.label, m.cls);
+}
+
+function CostEngineCategoriesRow(cat) {
+  return Object.keys(COST_CAT_META).map(k => {
+    const c = cat[k] || { n: 0, direct: 0, shared: 0, total: 0 };
+    return `<tr><td>${costCatBadge(k)}</td><td class="num">${c.n}</td>
+      <td class="num mono">${fmt(c.direct, 2)}</td>
+      <td class="num mono" style="color:#b8860b">${c.shared ? fmt(c.shared, 2) : '—'}</td>
+      <td class="num mono"><b>${fmt(c.total, 2)}</b></td></tr>`;
+  }).join('');
+}
+
+function methodCard(m, heading) {
+  const r = m.net_cost_per_qualified_unit;
+  const ittPositive = m.itt_cost_difference_per_unit > 0;
+  return `<div class="card">
+    <h3>${heading} <span class="small muted">[${m.method}]</span></h3>
+    <p class="section-desc">${m.principle}</p>
+    <dl class="kv">
+      <dt>已归属 gross</dt><dd class="mono">${money(m.attributed_gross_cost)}</dd>
+      <dt>未归属余额</dt><dd class="mono">${m.unallocated_amount > 0 ? '<b style="color:#b8860b">' + money(m.unallocated_amount) + '</b>' : '<span class="expected-ok">¥0.00（账面完整）</span>'}</dd>
+      <dt>已确认抵扣</dt><dd class="mono">−${money(m.confirmed_offset_total)}</dd>
+      <dt>净运营成本总额</dt><dd class="mono"><b>${money(m.net_operating_cost_total)}</b></dd>
+      <dt>每合格单元净成本区间</dt><dd class="mono"><b>${money(r.low)} ~ ${money(r.high)}</b><div class="small muted">点值 ${money(r.point)} / 单元（720 单元，4 周）</div></dd>
+      <dt>处理臂 / 对照臂单元均值</dt><dd class="mono">${money(m.treatment.net_cost_per_unit)} / ${money(m.control.net_cost_per_unit)}</dd>
+      <dt>ITT 成本差（T−C）</dt><dd class="mono"><b style="color:${ittPositive ? 'var(--red,#d64545)' : 'var(--green,#2e9e5b)'}">${signedYuan(m.itt_cost_difference_per_unit)}/单元</b>
+        <div>区间 <b>${signedYuan(m.itt_low)} ~ ${signedYuan(m.itt_high)}</b> 元/单元</div>
+        <div class="small muted">${m.itt_interval_kind}</div></dd>
+    </dl>
+    <p class="small muted" style="margin-bottom:0">${m.itt_interpretation}</p>
+  </div>`;
+}
+
+function check(label, ok, extra) {
+  return `<div class="check-row ${ok ? 'ok' : 'bad'}">
+    <span>${ok ? '✅' : '❌'}</span>
+    <div><div>${label}</div>${extra ? `<div class="small mono muted">${extra}</div>` : ''}</div>
+  </div>`;
+}
+
+function offsetDesc(code) {
+  if (code === 'OFF-CONF-001') return '备用车场损保险小额追偿（已到账）';
+  if (code === 'OFF-EST-UNCONF-001') return '运营方自报增收+用工节省估算，无清算凭证';
+  if (code === 'OFF-UI-PLUG') return '本页“填平成本”交互测试单（可还原为未确认）';
+  if (code === 'OFF-VERIFY-X' || code === 'OFF-VERIFY-COST') return 'verify.sh 纪律核验单（可重复执行）';
+  return '';
 }
 
 /* ---------------- 护栏 ---------------- */
